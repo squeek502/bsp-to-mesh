@@ -8,6 +8,7 @@ import (
     "github.com/galaco/bsp/primitives/texinfo"
     "github.com/galaco/bsp/primitives/brush"
     "github.com/galaco/bsp/primitives/brushside"
+    "github.com/galaco/bsp/primitives/model"
     "github.com/go-gl/mathgl/mgl32"
     "log"
     "math"
@@ -20,6 +21,10 @@ import (
     "github.com/tchayen/triangolatte"
     "sort"
     "io"
+    "github.com/golang-source-engine/stringtable"
+    "encoding/binary"
+    "strings"
+    "bufio"
 )
 
 var bspId = 0
@@ -34,6 +39,7 @@ type BSPData struct {
     texInfos   []texinfo.TexInfo
     brushes    []brush.Brush
     brushSides []brushside.BrushSide
+    models     []model.Model
 }
 
 func main() {
@@ -56,16 +62,41 @@ func main() {
         texInfos:   file.Lump(bsp.LumpTexInfo).(*lumps.TexInfo).GetData(),
         brushes:    file.Lump(bsp.LumpBrushes).(*lumps.Brush).GetData(),
         brushSides: file.Lump(bsp.LumpBrushSides).(*lumps.BrushSide).GetData(),
+        models:     file.Lump(bsp.LumpModels).(*lumps.Model).GetData(),
     }
 
-    bspMesh := NewMesh()
+    // load string table
+    stringData := file.Lump(bsp.LumpTexDataStringData).(*lumps.TexDataStringData).GetData()
+    stringTableArrayBytes, _ := file.Lump(bsp.LumpTexDataStringTable).Marshall()
+    stringTableArray := make([]int32, len(stringTableArrayBytes)/4)
+    for i := range stringTableArray {
+        intBytes := stringTableArrayBytes[i*4:(i+1)*4]
+        stringTableArray[i] = int32(binary.LittleEndian.Uint32(intBytes))
+    }
+    stringTable := stringtable.NewFromExistingStringTableData(stringData, stringTableArray)
 
-    for _, face := range bspData.faces {
-        if face.DispInfo > -1 {
-            //panic("don't want to handle displacements")
-        } else {
-            generateBspFace(&face, &bspData, bspMesh)
+    // entities
+    entityLumpStringRaw := strings.Trim(file.Lump(bsp.LumpEntities).(*lumps.EntData).GetData(), "\x00")
+    entityLumpStrings := strings.SplitAfter(entityLumpStringRaw, "}")
+    entities := make([]map[string]string, 0)
+    for _, entityLumpString := range entityLumpStrings {
+        // skip empty entity strings
+        if len(strings.TrimSpace(entityLumpString)) == 0 {
+            continue
         }
+        kvMap := make(map[string]string)
+        linesScanner := bufio.NewScanner(strings.NewReader(entityLumpString))
+        for linesScanner.Scan() {
+            line := linesScanner.Text()
+            if line == "{" || line == "}" || len(line) == 0 {
+                continue
+            }
+            prop := strings.Split(line, "\" \"")
+            key := strings.Trim(prop[0], "\"")
+            value := strings.Trim(prop[1], "\"")
+            kvMap[key] = value
+        }
+        entities = append(entities, kvMap)
     }
 
     outfile, err := os.Create("out.js")
@@ -73,6 +104,46 @@ func main() {
         log.Fatal(err)
     }
     defer outfile.Close()
+
+    for _, entity := range entities {
+        classname := entity["classname"]
+        if classname != "trigger_ff_script" {
+            continue
+        }
+        entityOriginParts := strings.Split(entity["origin"], " ")
+        entityOriginX, _ := strconv.Atoi(entityOriginParts[0])
+        entityOriginY, _ := strconv.Atoi(entityOriginParts[1])
+        entityOriginZ, _ := strconv.Atoi(entityOriginParts[2])
+        modelIndexStr := strings.Trim(entity["model"], "*")
+        modelIndex, _ := strconv.Atoi(modelIndexStr)
+        model := bspData.models[modelIndex]
+        mesh := NewMeshFromBrushEntity()
+        mesh.name = entity["targetname"]
+        mesh.mins = model.Mins
+        mesh.maxs = model.Maxs
+        mesh.origin = model.Origin.Add(mgl32.Vec3{float32(entityOriginX), float32(entityOriginY), float32(entityOriginZ)})
+        mesh.WriteToBabylon(outfile)
+    }
+
+    // all rendered faces go into a single mesh
+    bspMesh := NewMesh()
+
+    for _, face := range bspData.faces {
+        stringIndex := int(bspData.texInfos[face.TexInfo].TexData)
+        materialName, err := stringTable.FindString(stringIndex)
+        if err != nil {
+            log.Fatal(err)
+        }
+        if strings.HasPrefix(materialName, "TOOLS/") {
+            continue
+        }
+
+        if face.DispInfo > -1 {
+            //panic("don't want to handle displacements")
+        } else {
+           generateBspFace(&face, &bspData, bspMesh)
+        }
+    }
 
     // Write the faces to a Babylon mesh
     bspMesh.WriteToBabylon(outfile)
@@ -82,7 +153,26 @@ func main() {
         if (brush.Contents & bsp.MASK_SOLID == 0) {
             continue
         }
+
+        // check if this brush is 100% textured by tools
+        // if so, then just skip it
         brushSides := bspData.brushSides[brush.FirstSide:(brush.FirstSide + brush.NumSides)]
+        allToolTextures := true
+        for _, side := range brushSides {
+            stringIndex := int(bspData.texInfos[side.TexInfo].TexData)
+            materialName, err := stringTable.FindString(stringIndex)
+            if err != nil {
+                log.Fatal(err)
+            }
+            if !strings.HasPrefix(materialName, "TOOLS/") {
+                allToolTextures = false
+                break
+            }
+        }
+        if (allToolTextures) {
+            continue
+        }
+
         planes := make([]*plane.Plane, len(brushSides))
         verticesBySide := make([][]mgl32.Vec3, len(brushSides))
 
@@ -236,6 +326,33 @@ func SortVertices(points []triangolatte.Point) ([]triangolatte.Point) {
 
 func ToDegrees(radians float64) float64 {
     return radians * (180.0 / math.Pi)
+}
+
+type MeshFromBrushEntity struct {
+    mins            mgl32.Vec3
+    maxs            mgl32.Vec3
+    origin          mgl32.Vec3
+    name            string
+}
+
+func NewMeshFromBrushEntity() *MeshFromBrushEntity {
+    return &MeshFromBrushEntity{}
+}
+
+func (mesh *MeshFromBrushEntity) WriteToBabylon(writer io.StringWriter) {
+    width := f32Abs(mesh.maxs.X() - mesh.mins.X())
+    depth := f32Abs(mesh.maxs.Y() - mesh.mins.Y())
+    height := f32Abs(mesh.maxs.Z() - mesh.mins.Z())
+
+    meshDecl := fmt.Sprintf("var mesh = new BABYLON.MeshBuilder.CreateBox(\"%s\", {width: %f, depth: %f, height: %f}, scene);\n", mesh.name, width, depth, height);
+    writer.WriteString(meshDecl)
+
+    writer.WriteString("mesh.bspPlanes = [];\n")
+    meshPos := fmt.Sprintf("mesh.position = new BABYLON.Vector3(%f, %f, %f);\n", mesh.origin.X(), mesh.origin.Z(), mesh.origin.Y())
+    writer.WriteString(meshPos)
+    // TODO: remove this, just for debugging purposes
+    writer.WriteString("mesh.visibility = 0.25;\n")
+    writer.WriteString("scene.triggers.push(mesh);\n")
 }
 
 type MeshFromPlanes struct {
