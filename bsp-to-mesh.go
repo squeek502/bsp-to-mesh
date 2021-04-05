@@ -107,7 +107,7 @@ func main() {
 
     for _, entity := range entities {
         classname := entity["classname"]
-        if classname != "trigger_ff_script" {
+        if !strings.HasPrefix(classname, "trigger_") {
             continue
         }
         entityOriginParts := strings.Split(entity["origin"], " ")
