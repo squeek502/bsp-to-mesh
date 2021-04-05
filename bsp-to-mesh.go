@@ -150,27 +150,35 @@ func main() {
 
     // Get the planes used for collisions from the brush data, though
     for _, brush := range bspData.brushes {
-        if (brush.Contents & bsp.MASK_SOLID == 0) {
+        if (brush.Contents & bsp.MASK_PLAYERSOLID == 0) {
             continue
         }
+        isPlayerClip := brush.Contents & bsp.CONTENTS_PLAYERCLIP != 0
+        brushSides := bspData.brushSides[brush.FirstSide:(brush.FirstSide + brush.NumSides)]
 
         // check if this brush is 100% textured by tools
         // if so, then just skip it
-        brushSides := bspData.brushSides[brush.FirstSide:(brush.FirstSide + brush.NumSides)]
-        allToolTextures := true
-        for _, side := range brushSides {
-            stringIndex := int(bspData.texInfos[side.TexInfo].TexData)
-            materialName, err := stringTable.FindString(stringIndex)
-            if err != nil {
-                log.Fatal(err)
+        // note: player clip brushes get compiled into nodraw textured faces
+        if (!isPlayerClip) {
+            allToolTextures := true
+            for _, side := range brushSides {
+                stringIndex := int(bspData.texInfos[side.TexInfo].TexData)
+                materialName, err := stringTable.FindString(stringIndex)
+                if err != nil {
+                    log.Fatal(err)
+                }
+                isAnyToolsTexture := strings.HasPrefix(materialName, "TOOLS/")
+                if isPlayerClip {
+                    fmt.Println(materialName)
+                }
+                if !isAnyToolsTexture || isPlayerClip {
+                    allToolTextures = false
+                    break
+                }
             }
-            if !strings.HasPrefix(materialName, "TOOLS/") {
-                allToolTextures = false
-                break
+            if (allToolTextures) {
+                continue
             }
-        }
-        if (allToolTextures) {
-            continue
         }
 
         planes := make([]*plane.Plane, len(brushSides))
